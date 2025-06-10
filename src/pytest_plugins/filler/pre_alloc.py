@@ -250,6 +250,18 @@ class Alloc(BaseAlloc):
                 return
         super().__setitem__(address, Account(balance=amount))
 
+    # start here
+    def empty_account(self) -> str:
+        # returns the EOA address with 0's in all states
+        address = next(self.eoa_iterator)
+        self.alloc[address] = {
+            "balance": "0x0",
+            "nonce": "0x0",
+            "code": "0x",
+            "storage": {},
+        }
+        return address
+
     def empty_account(self) -> Address:
         """
         Add a previously unused account guaranteed to be empty to the pre-alloc.

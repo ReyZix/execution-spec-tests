@@ -1,52 +1,68 @@
-"""Pre-allocation fixtures using for test filling."""
+"""Pre-alloc specifically conditioned for test filling."""
 
+import inspect
+from enum import IntEnum
+from functools import cache
 from itertools import count
-from random import randint
-from typing import Generator, Iterator, List, Literal, Tuple
+from typing import Iterator, Literal
 
 import pytest
 from pydantic import PrivateAttr
 
-from ethereum_test_base_types import Bytes, Number, StorageRootType, ZeroPaddedHexNumber
+from ethereum_test_base_types import (
+    Account,
+    Address,
+    Number,
+    Storage,
+    StorageRootType,
+    TestPrivateKey,
+    TestPrivateKey2,
+    ZeroPaddedHexNumber,
+)
 from ethereum_test_base_types.conversions import (
     BytesConvertible,
     FixedSizeBytesConvertible,
     NumberConvertible,
 )
-from ethereum_test_forks import Fork
-from ethereum_test_rpc import EthRPC
-from ethereum_test_rpc.types import TransactionByHashResponse
-from ethereum_test_tools import (
-    EOA,
-    Account,
-    Address,
-    AuthorizationTuple,
-    Initcode,
-    Storage,
-    Transaction,
-)
-from ethereum_test_tools import Alloc as BaseAlloc
-from ethereum_test_tools import Opcodes as Op
+from ethereum_test_types import EOA
+from ethereum_test_types import Alloc as BaseAlloc
 from ethereum_test_types.eof.v1 import Container
 from ethereum_test_vm import Bytecode, EVMCodeType, Opcodes
 
-MAX_BYTECODE_SIZE = 24576
+CONTRACT_START_ADDRESS_DEFAULT = 0x1000
+CONTRACT_ADDRESS_INCREMENTS_DEFAULT = 0x100
 
-MAX_INITCODE_SIZE = MAX_BYTECODE_SIZE * 2
 
-
-def pytest_addoption(parser):
+def pytest_addoption(parser: pytest.Parser):
     """Add command-line options to pytest."""
     pre_alloc_group = parser.getgroup(
-        "pre_alloc", "Arguments defining pre-allocation behavior during test execution"
+        "pre_alloc", "Arguments defining pre-allocation behavior during test filling."
+    )
+
+    pre_alloc_group.addoption(
+        "--strict-alloc",
+        action="store_true",
+        dest="strict_alloc",
+        default=False,
+        help=("[DEBUG ONLY] Disallows deploying a contract in a predefined address."),
     )
     pre_alloc_group.addoption(
-        "--eoa-start",
+        "--ca-start",
+        "--contract-address-start",
         action="store",
-        dest="eoa_iterator_start",
-        default=randint(0, 2**256),
-        type=int,
-        help="The start private key from which tests will deploy EOAs.",
+        dest="test_contract_start_address",
+        default=f"{CONTRACT_START_ADDRESS_DEFAULT}",
+        type=str,
+        help="The starting address from which tests will deploy contracts.",
+    )
+    pre_alloc_group.addoption(
+        "--ca-incr",
+        "--contract-address-increment",
+        action="store",
+        dest="test_contract_address_increments",
+        default=f"{CONTRACT_ADDRESS_INCREMENTS_DEFAULT}",
+        type=str,
+        help="The address increment value to each deployed contract by a test.",
     )
     pre_alloc_group.addoption(
         "--evm-code-type",
@@ -57,77 +73,51 @@ def pytest_addoption(parser):
         choices=list(EVMCodeType),
         help="Type of EVM code to deploy in each test by default.",
     )
-    pre_alloc_group.addoption(
-        "--eoa-fund-amount-default",
-        action="store",
-        dest="eoa_fund_amount_default",
-        default=10**18,
-        type=int,
-        help="The default amount of wei to fund each EOA in each test with.",
-    )
 
 
-@pytest.hookimpl(trylast=True)
-def pytest_report_header(config):
-    """Pytest hook called to obtain the report header."""
-    bold = "\033[1m"
-    reset = "\033[39;49m"
-    eoa_start = config.getoption("eoa_iterator_start")
-    header = [
-        (bold + f"Start seed for EOA: {hex(eoa_start)} " + reset),
-    ]
-    return header
+class AllocMode(IntEnum):
+    """Allocation mode for the state."""
+
+    PERMISSIVE = 0
+    STRICT = 1
 
 
-@pytest.fixture(scope="session")
-def eoa_iterator(request) -> Iterator[EOA]:
-    """Return an iterator that generates EOAs."""
-    eoa_start = request.config.getoption("eoa_iterator_start")
-    print(f"Starting EOA index: {hex(eoa_start)}")
-    return iter(EOA(key=i, nonce=0) for i in count(start=eoa_start))
+DELEGATION_DESIGNATION = b"\xef\x01\x00"
 
 
 class Alloc(BaseAlloc):
-    """A custom class that inherits from the original Alloc class."""
+    """Allocation of accounts in the state, pre and post test execution."""
 
-    _fork: Fork = PrivateAttr()
-    _sender: EOA = PrivateAttr()
-    _eth_rpc: EthRPC = PrivateAttr()
-    _txs: List[Transaction] = PrivateAttr(default_factory=list)
-    _deployed_contracts: List[Tuple[Address, Bytes]] = PrivateAttr(default_factory=list)
-    _funded_eoa: List[EOA] = PrivateAttr(default_factory=list)
+    _alloc_mode: AllocMode = PrivateAttr()
+    _contract_address_iterator: Iterator[Address] = PrivateAttr()
+    _eoa_iterator: Iterator[EOA] = PrivateAttr()
     _evm_code_type: EVMCodeType | None = PrivateAttr(None)
-    _chain_id: int = PrivateAttr()
 
     def __init__(
         self,
         *args,
-        fork: Fork,
-        sender: EOA,
-        eth_rpc: EthRPC,
+        alloc_mode: AllocMode,
+        contract_address_iterator: Iterator[Address],
         eoa_iterator: Iterator[EOA],
-        chain_id: int,
-        eoa_fund_amount_default: int,
         evm_code_type: EVMCodeType | None = None,
         **kwargs,
     ):
-        """Initialize the pre-alloc with the given parameters."""
+        """Initialize allocation with the given properties."""
         super().__init__(*args, **kwargs)
-        self._fork = fork
-        self._sender = sender
-        self._eth_rpc = eth_rpc
+        self._alloc_mode = alloc_mode
+        self._contract_address_iterator = contract_address_iterator
         self._eoa_iterator = eoa_iterator
         self._evm_code_type = evm_code_type
-        self._chain_id = chain_id
-        self._eoa_fund_amount_default = eoa_fund_amount_default
 
     def __setitem__(self, address: Address | FixedSizeBytesConvertible, account: Account | None):
         """Set account associated with an address."""
-        raise ValueError("Tests are not allowed to set pre-alloc items in execute mode")
+        if self._alloc_mode == AllocMode.STRICT:
+            raise ValueError("Cannot set items in strict mode")
+        super().__setitem__(address, account)
 
     def code_pre_processor(
-        self, code: Bytecode | Container, *, evm_code_type: EVMCodeType | None
-    ) -> Bytecode | Container:
+        self, code: BytesConvertible, *, evm_code_type: EVMCodeType | None
+    ) -> BytesConvertible:
         """Pre-processes the code before setting it."""
         if evm_code_type is None:
             evm_code_type = self._evm_code_type
@@ -149,76 +139,44 @@ class Alloc(BaseAlloc):
         evm_code_type: EVMCodeType | None = None,
         label: str | None = None,
     ) -> Address:
-        """Deploy a contract to the allocation."""
+        """
+        Deploy a contract to the allocation.
+
+        Warning: `address` parameter is a temporary solution to allow tests to hard-code the
+        contract address. Do NOT use in new tests as it will be removed in the future!
+        """
         if storage is None:
             storage = {}
-        assert address is None, "address parameter is not supported"
-
-        if not isinstance(storage, Storage):
-            storage = Storage(storage)  # type: ignore
-
-        initcode_prefix = Bytecode()
-
-        deploy_gas_limit = 21_000 + 32_000
-
-        if len(storage.root) > 0:
-            initcode_prefix += sum(Op.SSTORE(key, value) for key, value in storage.root.items())
-            deploy_gas_limit += len(storage.root) * 22_600
-
-        assert isinstance(code, Bytecode) or isinstance(code, Container), (
-            f"incompatible code type: {type(code)}"
-        )
-        code = self.code_pre_processor(code, evm_code_type=evm_code_type)
-
-        assert len(code) <= MAX_BYTECODE_SIZE, f"code too large: {len(code)} > {MAX_BYTECODE_SIZE}"
-
-        deploy_gas_limit += len(bytes(code)) * 200
-
-        initcode: Bytecode | Container
-
-        if evm_code_type == EVMCodeType.EOF_V1:
-            assert isinstance(code, Container)
-            initcode = Container.Init(deploy_container=code, initcode_prefix=initcode_prefix)
+        if address is not None:
+            assert self._alloc_mode == AllocMode.PERMISSIVE, "address parameter is not supported"
+            assert address not in self, f"address {address} already in allocation"
+            contract_address = address
         else:
-            initcode = Initcode(deploy_code=code, initcode_prefix=initcode_prefix)
-            memory_expansion_gas_calculator = self._fork.memory_expansion_gas_calculator()
-            deploy_gas_limit += memory_expansion_gas_calculator(new_bytes=len(bytes(initcode)))
+            contract_address = next(self._contract_address_iterator)
 
-        assert len(initcode) <= MAX_INITCODE_SIZE, (
-            f"initcode too large {len(initcode)} > {MAX_INITCODE_SIZE}"
-        )
-
-        calldata_gas_calculator = self._fork.calldata_gas_calculator()
-        deploy_gas_limit += calldata_gas_calculator(data=initcode)
-
-        # Limit the gas limit
-        deploy_gas_limit = min(deploy_gas_limit * 2, 30_000_000)
-        print(f"Deploying contract with gas limit: {deploy_gas_limit}")
-
-        deploy_tx = Transaction(
-            sender=self._sender,
-            to=None,
-            data=initcode,
-            value=balance,
-            gas_limit=deploy_gas_limit,
-        ).with_signature_and_sender()
-        self._eth_rpc.send_transaction(deploy_tx)
-        self._txs.append(deploy_tx)
-
-        contract_address = deploy_tx.created_contract
-        self._deployed_contracts.append((contract_address, Bytes(code)))
-
-        assert Number(nonce) >= 1, "impossible to deploy contract with nonce lower than one"
+        if self._alloc_mode == AllocMode.STRICT:
+            assert Number(nonce) >= 1, "impossible to deploy contract with nonce lower than one"
 
         super().__setitem__(
             contract_address,
             Account(
                 nonce=nonce,
                 balance=balance,
-                code=code,
+                code=self.code_pre_processor(code, evm_code_type=evm_code_type),
                 storage=storage,
             ),
         )
+        if label is None:
+            # Try to deduce the label from the code
+            frame = inspect.currentframe()
+            if frame is not None:
+                caller_frame = frame.f_back
+                if caller_frame is not None:
+                    code_context = inspect.getframeinfo(caller_frame).code_context
+                    if code_context is not None:
+                        line = code_context[0].strip()
+                        if "=" in line:
+                            label = line.split("=")[0].strip()
 
         contract_address.label = label
         return contract_address
@@ -231,93 +189,50 @@ class Alloc(BaseAlloc):
         delegation: Address | Literal["Self"] | None = None,
         nonce: NumberConvertible | None = None,
     ) -> EOA:
-        """Add a previously unused EOA to the pre-alloc with the balance specified by `amount`."""
-        assert nonce is None, "nonce parameter is not supported for execute"
+        """
+        Add a previously unused EOA to the pre-alloc with the balance specified by `amount`.
+
+        If amount is 0, nothing will be added to the pre-alloc but a new and unique EOA will be
+        returned.
+        """
         eoa = next(self._eoa_iterator)
-        # Send a transaction to fund the EOA
         if amount is None:
             amount = self._eoa_fund_amount_default
-
-        fund_tx: Transaction | None = None
-        if delegation is not None or storage is not None:
-            if storage is not None:
-                sstore_address = self.deploy_contract(
-                    code=(
-                        sum(Op.SSTORE(key, value) for key, value in storage.root.items()) + Op.STOP
-                    )
+        if (
+            Number(amount) > 0
+            or storage is not None
+            or delegation is not None
+            or (nonce is not None and Number(nonce) > 0)
+        ):
+            if storage is None and delegation is None:
+                nonce = Number(0 if nonce is None else nonce)
+                account = Account(
+                    nonce=nonce,
+                    balance=amount,
                 )
-                set_storage_tx = Transaction(
-                    sender=self._sender,
-                    to=eoa,
-                    authorization_list=[
-                        AuthorizationTuple(
-                            chain_id=self._chain_id,
-                            address=sstore_address,
-                            nonce=eoa.nonce,
-                            signer=eoa,
-                        ),
-                    ],
-                    gas_limit=100_000,
-                ).with_signature_and_sender()
-                eoa.nonce = Number(eoa.nonce + 1)
-                self._eth_rpc.send_transaction(set_storage_tx)
-                self._txs.append(set_storage_tx)
-
-            if delegation is not None:
+                if nonce > 0:
+                    eoa.nonce = nonce
+            else:
+                # Type-4 transaction is sent to the EOA to set the storage, so the nonce must be 1
                 if not isinstance(delegation, Address) and delegation == "Self":
                     delegation = eoa
-                # TODO: This tx has side-effects on the EOA state because of the delegation
-                fund_tx = Transaction(
-                    sender=self._sender,
-                    to=eoa,
-                    value=amount,
-                    authorization_list=[
-                        AuthorizationTuple(
-                            chain_id=self._chain_id,
-                            address=delegation,
-                            nonce=eoa.nonce,
-                            signer=eoa,
-                        ),
-                    ],
-                    gas_limit=100_000,
-                ).with_signature_and_sender()
-                eoa.nonce = Number(eoa.nonce + 1)
-            else:
-                fund_tx = Transaction(
-                    sender=self._sender,
-                    to=eoa,
-                    value=amount,
-                    authorization_list=[
-                        AuthorizationTuple(
-                            chain_id=self._chain_id,
-                            address=0,  # Reset delegation to an address without code
-                            nonce=eoa.nonce,
-                            signer=eoa,
-                        ),
-                    ],
-                    gas_limit=100_000,
-                ).with_signature_and_sender()
-                eoa.nonce = Number(eoa.nonce + 1)
+                # If delegation is None but storage is not, realistically the nonce should be 2
+                # because the account must have delegated to set the storage and then again to
+                # reset the delegation (but can be overridden by the test for a non-realistic
+                # scenario)
+                real_nonce = 2 if delegation is None else 1
+                nonce = Number(real_nonce if nonce is None else nonce)
+                account = Account(
+                    nonce=nonce,
+                    balance=amount,
+                    storage=storage if storage is not None else {},
+                    code=DELEGATION_DESIGNATION + bytes(delegation)  # type: ignore
+                    if delegation is not None
+                    else b"",
+                )
+                eoa.nonce = nonce
 
-        else:
-            if Number(amount) > 0:
-                fund_tx = Transaction(
-                    sender=self._sender,
-                    to=eoa,
-                    value=amount,
-                ).with_signature_and_sender()
-
-        if fund_tx is not None:
-            self._eth_rpc.send_transaction(fund_tx)
-            self._txs.append(fund_tx)
-        super().__setitem__(
-            eoa,
-            Account(
-                nonce=eoa.nonce,
-                balance=amount,
-            ),
-        )
-        self._funded_eoa.append(eoa)
+            super().__setitem__(eoa, account)
         return eoa
 
     def fund_address(self, address: Address, amount: NumberConvertible):
@@ -327,53 +242,69 @@ class Alloc(BaseAlloc):
         If the address is already present in the pre-alloc the amount will be
         added to its existing balance.
         """
-        fund_tx = Transaction(
-            sender=self._sender,
-            to=address,
-            value=amount,
-        ).with_signature_and_sender()
-        self._eth_rpc.send_transaction(fund_tx)
-        self._txs.append(fund_tx)
         if address in self:
             account = self[address]
             if account is not None:
                 current_balance = account.balance or 0
                 account.balance = ZeroPaddedHexNumber(current_balance + Number(amount))
                 return
-
         super().__setitem__(address, Account(balance=amount))
 
-    def empty_account(self) -> Address:
-        """
-        Add a previously unused account guaranteed to be empty to the pre-alloc.
 
-        This ensures the account has:
-        - Zero balance
-        - Zero nonce
-        - No code
-        - No storage
+# start here
+# set as empty/ 0 for all values
+def empty_account(self) -> str:
+    address = next(self.eoa_iterator)
+    self.alloc[address] = {
+        "balance": "0x0",
+        "nonce": "0x0",
+        "code": "0x",
+        "storage": {},
+    }
+    return address
 
-        This is different from precompiles or system contracts. The function does not
-        send any transactions, ensuring that the account remains "empty."
 
-        Returns:
-            Address: The address of the created empty account.
+@pytest.fixture(scope="session")
+def alloc_mode(request: pytest.FixtureRequest) -> AllocMode:
+    """Return allocation mode for the tests."""
+    if request.config.getoption("strict_alloc"):
+        return AllocMode.STRICT
+    return AllocMode.PERMISSIVE
 
-        """
-        eoa = next(self._eoa_iterator)
 
-        super().__setitem__(
-            eoa,
-            Account(
-                nonce=0,
-                balance=0,
-            ),
-        )
-        return Address(eoa)
+@pytest.fixture(scope="session")
+def contract_start_address(request: pytest.FixtureRequest) -> int:
+    """Return starting address for contract deployment."""
+    return int(request.config.getoption("test_contract_start_address"), 0)
 
-    def wait_for_transactions(self) -> List[TransactionByHashResponse]:
-        """Wait for all transactions to be included in blocks."""
-        return self._eth_rpc.wait_for_transactions(self._txs)
+
+@pytest.fixture(scope="session")
+def contract_address_increments(request: pytest.FixtureRequest) -> int:
+    """Return address increment for contract deployment."""
+    return int(request.config.getoption("test_contract_address_increments"), 0)
+
+
+@pytest.fixture(scope="function")
+def contract_address_iterator(
+    contract_start_address: int,
+    contract_address_increments: int,
+) -> Iterator[Address]:
+    """Return iterator over contract addresses."""
+    return iter(
+        Address(contract_start_address + (i * contract_address_increments)) for i in count()
+    )
+
+
+@cache
+def eoa_by_index(i: int) -> EOA:
+    """Return EOA by index."""
+    return EOA(key=TestPrivateKey + i if i != 1 else TestPrivateKey2, nonce=0)
+
+
+@pytest.fixture(scope="function")
+def eoa_iterator() -> Iterator[EOA]:
+    """Return iterator over EOAs copies."""
+    return iter(eoa_by_index(i).copy() for i in count())
 
 
 @pytest.fixture(autouse=True)
@@ -386,62 +317,17 @@ def evm_code_type(request: pytest.FixtureRequest) -> EVMCodeType:
     return EVMCodeType.LEGACY
 
 
-@pytest.fixture(scope="session")
-def eoa_fund_amount_default(request: pytest.FixtureRequest) -> int:
-    """Get the gas price for the funding transactions."""
-    return request.config.option.eoa_fund_amount_default
-
-
-@pytest.fixture(autouse=True, scope="function")
+@pytest.fixture(scope="function")
 def pre(
-    fork: Fork,
-    sender_key: EOA,
+    alloc_mode: AllocMode,
+    contract_address_iterator: Iterator[Address],
     eoa_iterator: Iterator[EOA],
-    eth_rpc: EthRPC,
     evm_code_type: EVMCodeType,
-    chain_id: int,
-    eoa_fund_amount_default: int,
-    default_gas_price: int,
-) -> Generator[Alloc, None, None]:
+) -> Alloc:
     """Return default pre allocation for all tests (Empty alloc)."""
-    # Record the starting balance of the sender
-    sender_test_starting_balance = eth_rpc.get_balance(sender_key)
-
-    # Prepare the pre-alloc
-    pre = Alloc(
-        fork=fork,
-        sender=sender_key,
-        eth_rpc=eth_rpc,
+    return Alloc(
+        alloc_mode=alloc_mode,
+        contract_address_iterator=contract_address_iterator,
         eoa_iterator=eoa_iterator,
         evm_code_type=evm_code_type,
-        chain_id=chain_id,
-        eoa_fund_amount_default=eoa_fund_amount_default,
     )
-
-    # Yield the pre-alloc for usage during the test
-    yield pre
-
-    # Refund all EOAs (regardless of whether the test passed or failed)
-    refund_txs = []
-    for eoa in pre._funded_eoa:
-        remaining_balance = eth_rpc.get_balance(eoa)
-        eoa.nonce = Number(eth_rpc.get_transaction_count(eoa))
-        refund_gas_limit = 21_000
-        tx_cost = refund_gas_limit * default_gas_price
-        if remaining_balance < tx_cost:
-            continue
-        refund_txs.append(
-            Transaction(
-                sender=eoa,
-                to=sender_key,
-                gas_limit=21_000,
-                gas_price=default_gas_price,
-                value=remaining_balance - tx_cost,
-            ).with_signature_and_sender()
-        )
-    eth_rpc.send_wait_transactions(refund_txs)
-
-    # Record the ending balance of the sender
-    sender_test_ending_balance = eth_rpc.get_balance(sender_key)
-    used_balance = sender_test_starting_balance - sender_test_ending_balance
-    print(f"Used balance={used_balance / 10**18:.18f}")

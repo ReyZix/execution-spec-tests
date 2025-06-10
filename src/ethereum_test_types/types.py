@@ -24,10 +24,9 @@ from pydantic import (
 )
 from trie import HexaryTrie
 
+from ethereum_test_base_types import AccessList, Account, Address
+from ethereum_test_base_types import Alloc as BaseAlloc
 from ethereum_test_base_types import (
-    AccessList,
-    Account,
-    Address,
     Bloom,
     BLSPublicKey,
     BLSSignature,
@@ -46,7 +45,6 @@ from ethereum_test_base_types import (
     TestPrivateKey,
     ZeroPaddedHexNumber,
 )
-from ethereum_test_base_types import Alloc as BaseAlloc
 from ethereum_test_base_types.conversions import (
     BytesConvertible,
     FixedSizeBytesConvertible,
@@ -297,6 +295,12 @@ class Alloc(BaseAlloc):
         added to its existing balance.
         """
         raise NotImplementedError("fund_address is not implemented in the base class")
+
+    # start here
+    @abstractmethod
+    def empty_account(self) -> str:
+        pass
+        # Returns an address for an empty eoa acc
 
 
 class WithdrawalGeneric(CamelModel, Generic[NumberBoundTypeVar]):
@@ -1172,5 +1176,7 @@ class Requests:
 
     def __bytes__(self) -> bytes:
         """Return requests hash."""
+        s: bytes = b"".join(r.sha256() for r in self.requests_list)
+        return Bytes(s).sha256()
         s: bytes = b"".join(r.sha256() for r in self.requests_list)
         return Bytes(s).sha256()
